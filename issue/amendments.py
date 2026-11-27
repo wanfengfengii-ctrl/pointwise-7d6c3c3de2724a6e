@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from issue import wear
 from issue.lookup import register_request, save_decision
 from proof.freeze import read_frozen_edition
 from runtime import Problem, text
@@ -20,6 +21,9 @@ def submit_amendment(db, data):
     read_frozen_edition(db, request.candidate)
     if request.original == request.candidate:
         raise Problem('same_edition', 'An amendment requires a different fixed edition', 400)
+    if wear.is_batch_paper(db, request.paper):
+        raise Problem('batch_paper_fixed', 'A batch paper keeps its signed edition', 409)
+    wear.reject_reserved_edition(db, request.candidate)
     return register_request(db, request)
 
 

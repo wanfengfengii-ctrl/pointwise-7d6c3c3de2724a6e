@@ -1,6 +1,6 @@
 from dataclasses import asdict
 
-from issue import evidence, lookup, orders, tickets
+from issue import evidence, lookup, orders, tickets, wear
 from issue.amendments import record_known_decision, submit_amendment
 from proof import freeze, layouts, plates
 from proof.steps import parse_step
@@ -11,7 +11,7 @@ from runtime import (Problem, Unavailable, install_sample, install_schema, invok
 def initialize_issue(path, sample=False):
     with transaction(path, write=True) as db:
         install_schema(db, (plates.SCHEMA, layouts.SCHEMA, freeze.SCHEMA, orders.SCHEMA,
-                            *lookup.SCHEMA, tickets.SCHEMA, evidence.SCHEMA))
+                            *lookup.SCHEMA, tickets.SCHEMA, evidence.SCHEMA, *wear.SCHEMA))
         if sample:
             from day import day_layouts, SAMPLE_PAPER
 
@@ -38,9 +38,21 @@ class IssueService:
             return self._amend(route, data)
         if route == 'receive':
             return self._receive(data)
-        write = route in ('plate', 'layout', 'freeze', 'issue', 'ticket')
+        if route == 'wear.reconcile':
+            return self._reconcile(data)
+        write = route in ('plate', 'layout', 'freeze', 'issue', 'ticket', 'wear.open', 'wear.issue')
         with transaction(self.path, write=write) as db:
             return self._local(db, route, data)
+
+    def _reconcile(self, data):
+        batch = text(data.get('batch'), 'batch')
+        paper = text(data.get('paper'), 'paper')
+        with transaction(self.path) as db:
+            wear.paper_payload(db, batch, paper)
+        state = invoke(self.press_url, 'wear.state', {'batch': batch, 'paper': paper})
+        with transaction(self.path, write=True) as db:
+            wear.record_verified(db, batch, paper, state)
+            return wear.compute_balance(db, batch)
 
     def _amend(self, route, data):
         if route == 'amend':
@@ -90,6 +102,17 @@ class IssueService:
             return freeze.edition_payload(frozen)
         if route == 'edition':
             return freeze.edition_payload(freeze.read_frozen_edition(db, text(data.get('edition'), 'edition')))
+        if route == 'wear.open':
+            return wear.open_batch(db, data.get('batch'), data.get('plate'), data.get('total'))
+        if route == 'wear.issue':
+            return wear.issue_wear_paper(db, data)
+        if route == 'wear.balance':
+            return wear.compute_balance(db, text(data.get('batch'), 'batch'))
+        if route == 'wear.paper':
+            paper = text(data.get('paper'), 'paper')
+            if 'batch' in data:
+                return wear.paper_payload(db, text(data.get('batch'), 'batch'), paper)
+            return wear.paper_by_paper(db, paper)
         if route == 'ticket.read':
             return asdict(tickets.read_ticket(db, positive(data.get('ticket_id'), 'ticket_id')))
         if route in ('issue', 'order', 'ticket', 'received', 'amend.record'):
@@ -98,7 +121,10 @@ class IssueService:
 
     def _paper_operation(self, db, route, paper, data):
         if route == 'issue':
-            return asdict(orders.issue_order(db, paper, text(data.get('edition'), 'edition')))
+            edition = text(data.get('edition'), 'edition')
+            if not wear.is_batch_paper(db, paper):
+                wear.reject_reserved_edition(db, edition)
+            return asdict(orders.issue_order(db, paper, edition))
         if route == 'order':
             order = orders.read_order(db, paper)
             return {**asdict(order), 'edition': freeze.edition_payload(freeze.read_frozen_edition(db, order.original))}

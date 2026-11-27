@@ -5,12 +5,11 @@ from bench.mount import mount_sheet
 from handoff import history, release
 from handoff.completion import check_completion
 from issue.tickets import decode_ticket
-from press import adoption, receipts, sheets
+from press import adoption, receipts, sheets, wear
 from press.impressions import submit_impression
 from proof.freeze import decode_edition
 from runtime import (Problem, install_sample, install_schema, invoke, local_url, positive,
                      serve, service_arguments, text, transaction)
-
 
 def _accept_arrival(db, paper, label, order):
     frozen = decode_edition(order['edition'])
@@ -23,7 +22,7 @@ def initialize_press(path, sample_order=None):
         editions, physical, impressions = sheets.SCHEMA
         install_schema(db, (editions, intake.SCHEMA, *occupancy.SCHEMA, unmount.SCHEMA,
                             returns.SCHEMA, physical, impressions, receipts.SCHEMA,
-                            adoption.SCHEMA, release.SCHEMA, history.SCHEMA))
+                            adoption.SCHEMA, release.SCHEMA, history.SCHEMA, *wear.SCHEMA))
         if sample_order is not None:
             def load(connection):
                 from day import SAMPLE_PAPER
@@ -46,14 +45,48 @@ class PressService:
             return self._press(data)
         if route == 'adopt':
             return self._adopt(data)
+        if route == 'wear.load':
+            return self._wear_load(data)
+        if route == 'wear.state':
+            return self._wear_state(data)
         if route == 'stage' and data.get('action') == 'arrive':
             paper = text(data.get('paper'), 'paper')
             label = text(data.get('label'), 'label')
             order = self._order(paper)
+            membership = self._wear_membership(paper)
             with transaction(self.path, write=True) as db:
-                return asdict(_accept_arrival(db, paper, label, order))
+                arrival = _accept_arrival(db, paper, label, order)
+                if membership is not None:
+                    wear.remember_member(db, paper, membership['batch'])
+                return asdict(arrival)
         with transaction(self.path, write=route in ('stage', 'release', 'pickup')) as db:
             return self._local(db, route, data)
+
+    def _wear_load(self, data):
+        batch = text(data.get('batch'), 'batch')
+        paper = text(data.get('paper'), 'paper')
+        label = text(data.get('label'), 'label')
+        ticket_ids = wear.request_tickets(data)
+        if label != paper:
+            raise Problem('wrong_paper', 'The load label does not match the paper')
+        record = invoke(self.issue_url, 'wear.paper', {'batch': batch, 'paper': paper})
+        order = self._order(paper)
+        if record['original'] != order['original'] or order['paper'] != paper:
+            raise Problem('batch_conflict', 'The batch identity does not match the formal order')
+        tickets = []
+        for ticket_id in ticket_ids:
+            ticket = invoke(self.issue_url, 'ticket.read', {'ticket_id': ticket_id})
+            if ticket['paper'] != paper:
+                raise Problem('wrong_paper', 'A loaded ticket belongs to a different paper')
+            tickets.append(ticket)
+        with transaction(self.path, write=True) as db:
+            return wear.load_manifest(db, batch, paper, tickets)
+
+    def _wear_state(self, data):
+        batch = text(data.get('batch'), 'batch')
+        paper = text(data.get('paper'), 'paper')
+        with transaction(self.path) as db:
+            return wear.press_state(db, batch, paper)
 
     def _press(self, data):
         paper = text(data.get('paper'), 'paper')
@@ -62,9 +95,26 @@ class PressService:
             previous = receipts.find_receipt(db, paper, ticket_id)
             if previous is not None:
                 return asdict(previous)
+            load = wear.read_load(db, paper)
+            stored = None if load is None else wear.stored_ticket(db, paper, ticket_id)
+        if load is not None:
+            if stored is None:
+                raise Problem('not_loaded', 'This ticket is not part of the loaded batch set', 409)
+            with transaction(self.path, write=True) as db:
+                return asdict(submit_impression(db, paper, stored))
         ticket = decode_ticket(invoke(self.issue_url, 'ticket.read', {'ticket_id': ticket_id}))
+        if self._wear_membership(paper) is not None:
+            raise Problem('not_loaded', 'A batch paper can only press tickets from its loaded set', 409)
         with transaction(self.path, write=True) as db:
             return asdict(submit_impression(db, paper, ticket))
+
+    def _wear_membership(self, paper):
+        try:
+            return invoke(self.issue_url, 'wear.paper', {'paper': paper})
+        except Problem as error:
+            if error.code == 'unknown_batch_paper':
+                return None
+            raise
 
     def _adopt(self, data):
         paper = text(data.get('paper'), 'paper')
@@ -117,6 +167,8 @@ class PressService:
             raise Problem('invalid_stage_action', 'Expected arrive, mount, return, or unmount', 400)
         mount_id = text(data.get('mount_id'), 'mount_id')
         if action == 'mount':
+            if wear.member(db, paper) is not None:
+                wear.require_load(db, paper)
             mount = mount_sheet(db, paper, mount_id)
             original = intake.read_arrival(db, paper).original
             sheets.open_sheet(db, mount, original)
